@@ -1,0 +1,15 @@
+# 每次启动、sshd 之前：确认数据盘挂在 /home、扩容、主机名与 DNS、dev 家目录（/usr/lib/llmgate-vm/init）。
+# 数据盘在 fstab 里是 nofail：没挂上时不进 emergency 模式，而是这里失败、sshd（Requires 本单元）不启动。
+[Unit]
+Description=llmgate-vm-init — 数据盘、主机名与 DNS
+Wants=home.mount
+After=home.mount local-fs.target
+Before=ssh.service llmgate-vm-setup.service systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/llmgate-vm/init
+
+[Install]
+WantedBy=multi-user.target

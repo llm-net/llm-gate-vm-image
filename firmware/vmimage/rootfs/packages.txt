@@ -1,0 +1,67 @@
+# VM rootfs 的包清单（Ubuntu 24.04 noble，main + universe）。一行一个包，# 起注释。
+# mmdebstrap 以 minbase 变体（Essential 与 Priority:required）为底，再装这里列的包及其硬依赖，不装 Recommends。
+
+# 基础系统：systemd 为 PID 1，udev 建 /dev/ptp_kvm 等设备链接，dbus 与 libpam-systemd 给登录会话（XDG_RUNTIME_DIR）。
+systemd
+systemd-sysv
+udev
+dbus
+libpam-systemd
+kmod
+iproute2
+iputils-ping
+netbase
+procps
+psmisc
+passwd
+adduser
+tzdata
+less
+nano
+vim-tiny
+bash-completion
+lsb-release
+
+# 包管理：minbase 变体不含 apt；仓库的 .llmgate/setup.sh 靠它装系统依赖，签名由 ubuntu-keyring 校验
+# （overlay 的 ubuntu.sources 指向它）。
+apt
+ubuntu-keyring
+
+# 纳管与登录：sshd（主机私钥在数据盘上）、免密 sudo。
+openssh-server
+openssh-client
+sudo
+
+# 开发环境。
+git
+tmux
+curl
+wget
+ca-certificates
+gnupg
+build-essential
+python3
+python3-venv
+xz-utils
+zstd
+bzip2
+unzip
+zip
+file
+jq
+rsync
+
+# 时间同步（refclock PHC /dev/ptp_kvm）。
+chrony
+
+# 数据盘扩容（resize2fs）。
+e2fsprogs
+
+# 工具配置页能装的创作工具：FFmpeg、CJK 字体、ImageMagick。
+ffmpeg
+fontconfig
+fonts-noto-cjk
+imagemagick
+
+# 容器：装好但缺省不启用，数据目录在数据盘 /home/.docker-data。
+docker.io

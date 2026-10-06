@@ -1,0 +1,5 @@
+# LLM Gate VM：系统盘 /dev/vda 来自镜像、可整盘替换；数据盘 /dev/vdb 挂 /home、持久（整棵 $HOME 与身份目录
+# /home/.llmgate-vm 都在上面）。数据盘 nofail：没挂上时由 llmgate-vm-init 报错、sshd 不启动，而不是卡在 emergency 模式。
+# <file system> <mount point> <type> <options>                                   <dump> <pass>
+/dev/vda        /             ext4   defaults,errors=remount-ro                  0      1
+/dev/vdb        /home         ext4   defaults,nofail,x-systemd.device-timeout=30s 0     2

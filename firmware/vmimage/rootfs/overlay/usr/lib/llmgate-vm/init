@@ -1,0 +1,163 @@
+#!/bin/bash
+# llmgate-vm-init：每次启动、sshd 之前跑一遍（llmgate-vm-init.service）。
+#
+#   1. 确认数据盘 /dev/vdb 挂在 /home（没挂上就失败，sshd 随之不启动——主机私钥与 authorized_keys 都在这块盘上）；
+#   2. 在线 resize2fs 数据盘与系统盘：系统盘文件由节点拷贝时撑到 16 GiB（稀疏），数据盘文件由节点在停机时扩大，
+#      这里把文件系统长满（已经满了就什么都不做）；
+#   3. 身份目录 /home/.llmgate-vm 只校正属主与权限（root、0700，私钥 0600），不改内容；
+#   4. 主机名：内核命令行 ip= 的第 5 段，没有就读 /home/.llmgate-vm/hostname；
+#   5. DNS：ip= 的第 8、9 段写成 /etc/resolv.conf（没有就退回内核自动配置的 /proc/net/pnp）；
+#   6. /home 校正为 root 0755；dev 的家目录 /home/dev：属主 1000:1000、去掉组与其他人的写权限（sshd StrictModes），缺的 shell 初始化文件
+#      从 /etc/skel 补上（已有的不动，不递归改属主）；
+#   7. chrony 的时钟源写到 /run/llmgate-vm/chrony/（chrony.conf 的 confdir）：有 KVM PTP 时钟就用 refclock PHC 跟宿主走，
+#      没有就退回 NTP 池。
+#
+# 内核命令行形如（节点 vmd 下发）：
+#   reboot=k panic=1 8250.nr_uarts=0 quiet net.ifnames=0 ip=<IP>::<网关>:<掩码>:<主机名>:eth0:off:<DNS1>:<DNS2>
+# 网卡地址由内核按 ip= 配好（CONFIG_IP_PNP），这里不碰网卡。
+set -u
+
+STATE_DIR=/home/.llmgate-vm
+HOST_KEY=$STATE_DIR/ssh_host_ed25519_key
+DATA_DEV=/dev/vdb
+GUEST_USER=dev
+GUEST_UID=1000
+
+log() { echo "llmgate-vm-init: $*"; }
+# fail 同时写内核日志（管理员临时打开串口排障时能看到）与 journal，然后以失败退出。
+fail() {
+	printf '<3>llmgate-vm-init: %s\n' "$*" >/dev/kmsg 2>/dev/null
+	echo "llmgate-vm-init: $*" >&2
+	exit 1
+}
+
+# ---- 1. 数据盘 ----
+mountpoint -q /home || fail "数据盘 $DATA_DEV 没有挂到 /home"
+home_src=$(findmnt -n -o SOURCE --target /home)
+[ "$home_src" = "$DATA_DEV" ] || fail "/home 挂的是 $home_src，不是数据盘 $DATA_DEV"
+
+# ---- 2. 扩容：失败只记录（文件系统照常可用） ----
+# 在线扩容（已挂载）；文件系统已占满设备时 resize2fs 什么都不做、照常返回 0。
+grow() {
+	local out
+	out=$(resize2fs "$1" 2>&1) || log "resize2fs $1 失败：$(printf '%s' "$out" | tail -n 2 | tr '\n' ' ')"
+}
+grow "$DATA_DEV"
+root_src=$(findmnt -n -o SOURCE --target /)
+case $root_src in
+/dev/vd*) grow "$root_src" ;;
+esac
+
+# ---- 3. 身份目录：只校正属主与权限 ----
+[ -d "$STATE_DIR" ] || fail "数据盘上没有 $STATE_DIR"
+chown root:root "$STATE_DIR" && chmod 0700 "$STATE_DIR"
+[ -s "$HOST_KEY" ] || fail "数据盘上没有主机私钥 $HOST_KEY"
+chown root:root "$HOST_KEY" && chmod 0600 "$HOST_KEY"
+
+# ---- 4 / 5. 解析内核命令行的 ip= ----
+ip_arg=
+read -r -a cmdline </proc/cmdline
+for arg in "${cmdline[@]}"; do
+	case $arg in
+	ip=*) ip_arg=${arg#ip=} ;;
+	esac
+done
+IFS=: read -r -a ip_f <<<"$ip_arg"
+
+# valid_label：RFC 1123 主机名 label（字母数字与连字符，1–63，不以连字符开头结尾）。
+valid_label() {
+	[[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+name=${ip_f[4]:-}
+if ! valid_label "$name"; then
+	name=
+	if [ -f "$STATE_DIR/hostname" ]; then
+		name=$(head -n 1 "$STATE_DIR/hostname" | tr -d '[:space:]')
+	fi
+fi
+if valid_label "$name"; then
+	hostname "$name"
+	printf '%s\n' "$name" >/etc/hostname.llmgate-vm.tmp && mv -f /etc/hostname.llmgate-vm.tmp /etc/hostname
+	# /etc/hosts：只维护 127.0.1.1 这一行（sudo 等要能解析本机名），其余行不动。
+	if [ -f /etc/hosts ]; then
+		awk -v n="$name" 'BEGIN { done = 0 }
+			$1 == "127.0.1.1" { if (!done) { print "127.0.1.1\t" n; done = 1 }; next }
+			{ print }
+			END { if (!done) print "127.0.1.1\t" n }' /etc/hosts >/etc/hosts.llmgate-vm.tmp &&
+			mv -f /etc/hosts.llmgate-vm.tmp /etc/hosts
+	fi
+else
+	log "内核命令行与 $STATE_DIR/hostname 都没有可用的主机名，保持 $(hostname)"
+fi
+
+valid_ipv4() {
+	[[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]
+}
+dns=()
+for d in "${ip_f[7]:-}" "${ip_f[8]:-}"; do
+	valid_ipv4 "$d" && dns+=("$d")
+done
+if [ ${#dns[@]} -eq 0 ] && [ -r /proc/net/pnp ]; then
+	while read -r key value _; do
+		[ "$key" = nameserver ] && valid_ipv4 "$value" && dns+=("$value")
+	done </proc/net/pnp
+fi
+if [ ${#dns[@]} -gt 0 ]; then
+	{
+		echo "# llmgate-vm-init 每次启动按内核命令行 ip= 重写，手工改动在下次启动时覆盖。"
+		for d in "${dns[@]}"; do echo "nameserver $d"; done
+	} >/etc/resolv.conf.llmgate-vm.tmp
+	# 镜像里 /etc/resolv.conf 是普通文件；万一被换成了符号链接，mv 会替换链接本身而不是写穿到目标。
+	mv -f /etc/resolv.conf.llmgate-vm.tmp /etc/resolv.conf
+else
+	log "内核命令行没有 DNS，保留现有 /etc/resolv.conf"
+fi
+
+# ---- 6. /home 与 dev 的家目录 ----
+# /home 是数据盘的根：有的 e2fsprogs 版本会把 mke2fs -d 种子目录的权限带进文件系统根，这里校正为 root 0755，
+# 否则 dev 进不了自己的家目录。
+chown root:root /home && chmod 0755 /home
+home=/home/$GUEST_USER
+if [ ! -d "$home" ]; then
+	log "数据盘上没有 $home，新建一个空的"
+	install -d -o "$GUEST_UID" -g "$GUEST_UID" -m 0750 "$home"
+fi
+chown "$GUEST_UID:$GUEST_UID" "$home"
+chmod go-w "$home"
+if [ -d "$home/.ssh" ] && [ ! -L "$home/.ssh" ]; then
+	chown "$GUEST_UID:$GUEST_UID" "$home/.ssh" && chmod 0700 "$home/.ssh"
+	ak=$home/.ssh/authorized_keys
+	if [ -f "$ak" ] && [ ! -L "$ak" ]; then
+		chown "$GUEST_UID:$GUEST_UID" "$ak" && chmod 0600 "$ak"
+	fi
+fi
+for f in .bashrc .profile .bash_logout; do
+	if [ -f "/etc/skel/$f" ] && [ ! -e "$home/$f" ] && [ ! -L "$home/$f" ]; then
+		install -o "$GUEST_UID" -g "$GUEST_UID" -m 0644 "/etc/skel/$f" "$home/$f"
+	fi
+done
+
+# ---- 7. 时钟源 ----
+# KVM PTP 时钟要宿主支持 KVM_HC_CLOCK_PAIRING（宿主时钟源是 TSC 的裸机）；嵌套虚拟化等场合没有这个设备。chronyd 打不开
+# refclock 设备会直接退出，所以不写死在 chrony.conf 里，而是每次启动按实际设备生成。按 clock_name 认设备，不等 udev 建
+# /dev/ptp_kvm 链接。
+chrony_dir=/run/llmgate-vm/chrony
+install -d -m 0755 "$chrony_dir"
+ptp=
+for d in /sys/class/ptp/ptp*; do
+	if [ -r "$d/clock_name" ] && [ "$(cat "$d/clock_name")" = "KVM virtual PTP" ]; then
+		ptp=/dev/${d##*/}
+		break
+	fi
+done
+if [ -n "$ptp" ]; then
+	echo "refclock PHC $ptp poll 3 dpoll -2 offset 0" >"$chrony_dir/time-source.conf"
+	time_source="KVM PTP 时钟 $ptp"
+else
+	echo "pool ntp.ubuntu.com iburst maxsources 4" >"$chrony_dir/time-source.conf"
+	time_source="NTP 池（没有 KVM PTP 时钟）"
+fi
+
+log "就绪：主机名 $(hostname)，数据盘 $(df -h --output=size /home | tail -n 1 | tr -d ' ')，时钟源 $time_source"
+exit 0

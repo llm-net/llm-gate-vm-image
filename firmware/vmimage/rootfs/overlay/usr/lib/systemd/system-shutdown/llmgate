@@ -1,0 +1,28 @@
+#!/bin/sh
+# 关机钩子：systemd-shutdown(8) 在关机的最后一步（进程已结束、文件系统已卸载或只读、已 sync）以动作名为 $1
+# 调用本目录下的可执行文件。
+#
+# poweroff / halt：经 vsock 通知节点——guest 连 CID 2（宿主）的 10240 端口，Firecracker 把它接到宿主上
+# <uds_path>_10240 的 Unix socket，由 vmd 的 run-vm 包装监听；写一行 "poweroff"。x86 上 guest 关机后 Firecracker
+# 进程不会退出，包装收到这一行就结束它，systemd 不再拉起。
+# reboot / kexec：不通知——内核参数 reboot=k 让 Firecracker 自己退出，包装按「需要重启」处理。
+#
+# 用镜像里本来就有的 python3（socket.AF_VSOCK），不另带二进制；-I -S 不读用户环境与 site，此时根文件系统只读也能跑。
+case "$1" in
+poweroff | halt) ;;
+*) exit 0 ;;
+esac
+exec /usr/bin/python3 -I -S -c '
+import socket, sys
+s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect((socket.VMADDR_CID_HOST, 10240))
+    s.sendall(b"poweroff\n")
+    s.shutdown(socket.SHUT_WR)
+    # 等节点读完关掉连接（或超时），确认这一行送到后再真正关机。
+    s.recv(1)
+except OSError as e:
+    print("llmgate: 关机通知没有送达节点: %s" % e, file=sys.stderr)
+    sys.exit(1)
+'

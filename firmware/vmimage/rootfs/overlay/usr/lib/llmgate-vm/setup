@@ -1,0 +1,86 @@
+#!/bin/bash
+# llmgate-vm-setup：以 dev 身份跑仓库声明系统依赖的脚本 ~dev/workspace/.llmgate/setup.sh，每块系统盘一次
+# （llmgate-vm-setup.service，Type=exec，排在 sshd 之后，在后台跑，不挡登录也不挡开机完成）。
+#
+# 「每块系统盘一次」靠系统盘上的标记 /var/lib/llmgate-vm/setup.done：镜像里没有它，所以新建的 VM 与重建系统盘
+# 后的第一次启动都会跑；跑过（不论成败）就写下标记，之后的启动不再跑。脚本还不存在（例如 VM 刚建好、仓库尚未
+# clone）时不写标记，等下次启动或有人 `sudo systemctl start llmgate-vm-setup.service` 再看；被停下（关机、到了
+# 单元的 2 小时上限）时也不写，下次启动再跑。
+#
+# 标记是结果的唯一来源（root、0644，dev 可读；设备的 devhost.RunVMSetup 读它报 ok / failed），三行：
+#   rc=<脚本的退出码>
+#   started=<UTC 时刻>
+#   finished=<UTC 时刻>
+# 手工重跑：sudo rm /var/lib/llmgate-vm/setup.done && sudo systemctl start llmgate-vm-setup.service
+#
+# 运行环境：dev 的登录 shell（读 ~/.profile），cwd 为 ~/workspace，stdin 为 /dev/null，
+# DEBIAN_FRONTEND=noninteractive（sudoers 放行它穿过 sudo）；可执行就直接执行，否则交给 bash。
+# 输出只留前 LOG_MAX 字节在 /var/log/llmgate-vm/setup.log（每次运行覆盖），超出的部分丢弃并注明。
+set -u
+
+GUEST_USER=dev
+SCRIPT_REL=.llmgate/setup.sh
+MARK_DIR=/var/lib/llmgate-vm
+MARK=$MARK_DIR/setup.done
+LOG_DIR=/var/log/llmgate-vm
+LOG=$LOG_DIR/setup.log
+LOG_MAX=$((4 * 1024 * 1024))
+
+if [ -e "$MARK" ]; then
+	echo "llmgate-vm-setup: 这块系统盘上已经跑过（$MARK），跳过"
+	exit 0
+fi
+
+home=$(getent passwd "$GUEST_USER" | cut -d: -f6)
+[ -n "$home" ] || { echo "llmgate-vm-setup: 没有用户 $GUEST_USER" >&2; exit 1; }
+script=$home/workspace/$SCRIPT_REL
+if [ ! -f "$script" ]; then
+	echo "llmgate-vm-setup: 没有 $script，这次不跑"
+	exit 0
+fi
+
+install -d -m 0755 "$MARK_DIR" "$LOG_DIR"
+started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+printf '== %s 以 %s 身份运行 ~/workspace/%s\n' "$started" "$GUEST_USER" "$SCRIPT_REL" >"$LOG"
+chmod 0644 "$LOG"
+echo "llmgate-vm-setup: 开始运行 $script，输出见 $LOG"
+
+# 内层命令是固定字符串，不拼任何变量；runuser -l 起 dev 的登录 shell。
+inner='cd "$HOME/workspace" || exit 1
+if [ -x .llmgate/setup.sh ]; then exec ./.llmgate/setup.sh; else exec /bin/bash .llmgate/setup.sh; fi'
+
+# 输出经一个小过滤器：前 LOG_MAX 字节边收边写进日志，其余照读（脚本不会因 SIGPIPE 中断）只计数，最后打印丢弃的
+# 字节数。pipefail：管道的退出码取 runuser 的（过滤器不会失败）。
+dropped=$(
+	set -o pipefail
+	DEBIAN_FRONTEND=noninteractive runuser -l "$GUEST_USER" -w DEBIAN_FRONTEND -c "$inner" </dev/null 2>&1 |
+		python3 -I -S -c '
+import sys
+limit, path = int(sys.argv[1]), sys.argv[2]
+kept = dropped = 0
+with open(path, "ab") as log:
+    while True:
+        chunk = sys.stdin.buffer.read1(65536)
+        if not chunk:
+            break
+        take = max(0, min(len(chunk), limit - kept))
+        if take:
+            log.write(chunk[:take])
+            log.flush()
+            kept += take
+        dropped += len(chunk) - take
+print(dropped)' "$LOG_MAX" "$LOG"
+)
+rc=$?
+finished=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+dropped=${dropped//[^0-9]/}
+if [ "${dropped:-0}" -gt 0 ]; then
+	printf '\n== 输出超过 %d 字节，其后的 %d 字节已丢弃\n' "$LOG_MAX" "$dropped" >>"$LOG"
+fi
+printf '== %s 结束，退出码 %d\n' "$finished" "$rc" >>"$LOG"
+
+printf 'rc=%d\nstarted=%s\nfinished=%s\n' "$rc" "$started" "$finished" >"$MARK.tmp" &&
+	chmod 0644 "$MARK.tmp" && mv -f "$MARK.tmp" "$MARK"
+echo "llmgate-vm-setup: 结束，退出码 $rc"
+# 脚本失败时单元也失败（systemctl --failed 可见）；标记照写，不会每次启动重跑。
+exit "$rc"

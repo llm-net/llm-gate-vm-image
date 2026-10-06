@@ -1,0 +1,21 @@
+# 每块系统盘一次：以 dev 身份跑 ~/workspace/.llmgate/setup.sh（/usr/lib/llmgate-vm/setup），排在 sshd 之后、不挡登录。
+#
+# Type=exec：启动作业在脚本 exec 之后就完成，脚本在后台跑，不把开机事务（multi-user.target、
+# systemctl is-system-running）拖到它跑完；跑的时候单元是 active，跑完回到 inactive（退出码 0）或 failed（非零）。
+# 结果以系统盘上的标记 /var/lib/llmgate-vm/setup.done 为准（格式见 /usr/lib/llmgate-vm/setup 开头）。
+# 手工触发：sudo systemctl start llmgate-vm-setup.service（立即返回；标记已在时条件不满足、什么都不跑）。
+[Unit]
+Description=llmgate-vm-setup — 每块系统盘跑一次仓库的 setup.sh
+Requires=llmgate-vm-init.service
+After=llmgate-vm-init.service ssh.service network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/llmgate-vm/setup.done
+
+[Service]
+Type=exec
+ExecStart=/usr/lib/llmgate-vm/setup
+# 上限 2 小时：到点被停下时不写标记（下次启动再跑），单元为 failed。
+RuntimeMaxSec=2h
+
+[Install]
+WantedBy=multi-user.target

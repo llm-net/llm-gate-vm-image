@@ -1,0 +1,3 @@
+# LLM Gate VM：dev 免密 sudo（VM 的边界就是工作空间的边界）；setup.sh 里的 sudo apt-get 需要 DEBIAN_FRONTEND 穿过 sudo。
+Defaults env_keep += "DEBIAN_FRONTEND"
+dev ALL=(ALL:ALL) NOPASSWD: ALL
