@@ -1,18 +1,19 @@
-# VM 镜像（Firecracker guest）
+# 配方与 guest 契约
 
-Firecracker 节点（守护进程 `llmgate-vmd`）上每台 microVM 都从这里构建的镜像启动。镜像分两部分：
+Firecracker 节点（守护进程 `llmgate-vmd`）上每台 microVM 都从本仓库构建的镜像启动。镜像分两部分：
 
 - **内核** `vmlinux`：Linux 6.18 的未压缩 ELF（Firecracker 在 x86-64 上直接引导它），所需功能全部编进内核，不带模块。
 - **rootfs** `rootfs.ext4`：Ubuntu 24.04 最小系统，作 VM 的系统盘（每台 VM 一份可写拷贝，可整盘替换）。
 
-镜像与节点之间的约定（用户、身份目录、vsock 端口、版本标记、`setup.sh`）以
-[`internal/vmd/api.go`](../internal/vmd/api.go)「guest 与节点之间的约定」为准，本目录的配方照它实现。方案背景见
-[独立主机工作空间](../../docs-dev/firmware-workspace-host.md)第 8、9 节。
+镜像与节点之间的约定（用户、身份目录、vsock 端口、版本标记、`setup.sh`）在设备侧以 LLM Gate 固件源码（llm-net/llm-gate）的
+`firmware/internal/vmd/api.go`「guest 与节点之间的约定」为准，本仓库的配方照它实现；
+下文「guest 契约」是镜像一侧的实现。构建、发布与升级的操作步骤见 [maintenance.md](maintenance.md)。
 
 ## 目录
 
 | 路径 | 内容 |
 |---|---|
+| `Makefile` | 入口：`print-version`、`deps`、`image`、`boot-test`、`manifest-entry`、`publish`、`check` |
 | `build.sh` | 构建入口：内核、rootfs、打包与摘要；钉住的上游版本与 SHA-256 都在文件开头 |
 | `boot-test.sh` | 本机开机冒烟测试（Firecracker 官方整包，不经 jailer） |
 | `kernel/microvm-kernel-ci-x86_64-6.18.config` | Firecracker v1.17.0 官方 guest 配置，**原样**入库（`resources/guest_configs/`，标签 `v1.17.0`，提交 `95f868c8e345b1cc8faccd1a3c910b4989dc3f58`，SHA-256 由 `build.sh` 核对） |
@@ -20,6 +21,10 @@ Firecracker 节点（守护进程 `llmgate-vmd`）上每台 microVM 都从这里
 | `rootfs/packages.txt` | 包清单 |
 | `rootfs/customize.sh` | mmdebstrap 装完包后在 chroot 里做的定制 |
 | `rootfs/overlay/` | 覆盖进 rootfs 的文件（权限在 `customize.sh` 的清单里逐个写明） |
+| `scripts/install-deps.sh` | 构建依赖（`make deps`） |
+| `scripts/check-overlay.sh` | 不需要 root 的配方自查（`make check`） |
+| `scripts/manifest-entry.py` | 由 `image.json` 生成官网签名清单条目草稿（`make manifest-entry`） |
+| `scripts/publish-release.sh` | 建 GitHub Release 并上传 `release/`（`make publish`） |
 
 ## 内核
 
@@ -116,7 +121,7 @@ reboot=k panic=1 8250.nr_uarts=0 quiet net.ifnames=0 ip=<IP>::<网关>:<掩码>:
    - VM 刚建好时仓库还没 clone：设备在 clone 之后触发一次（见下）。手工触发是
      `sudo systemctl start llmgate-vm-setup.service`（立即返回），重跑先删标记。
 
-**设备触发**（`internal/devhost/vmsetup.go` 的 `RunVMSetup`，建立工作空间的 setup 步骤调用）：以 dev 身份在一个 SSH
+**设备触发**（固件 `firmware/internal/devhost/vmsetup.go` 的 `RunVMSetup`，建立工作空间的 setup 步骤调用）：以 dev 身份在一个 SSH
 会话里跑一段固定脚本——没有标记时，仓库里没有 `setup.sh` 即报 `absent`，否则 `sudo systemctl start` 这个单元；然后等单元
 不再是 `active`（等待有上限 `vmSetupWait`，整条命令在 `agenthost.MaxRunTimeout` 之内），按标记报结果。标记在触发之前就有
 时不再触发，直接报它记下的结果。脚本输出的第一行是 `setup=<结果>`，其后是日志尾段：
@@ -152,38 +157,38 @@ unit）；`$HOME`、Docker 数据与身份都在数据盘上。
 
 构建机：Linux x86-64、root（mmdebstrap 的 root 模式与 `mke2fs -d` 保留属主）、约 10 GiB 空闲空间，能访问
 `cdn.kernel.org`、`snapshot.ubuntu.com`（或 `UBUNTU_MIRROR` 指定的 HTTPS 镜像站），核对主机公钥时访问 `api.github.com` 与
-`docs.gitlab.com`。依赖一次装好：
+`docs.gitlab.com`。
 
 ```sh
-bash scripts/install-toolchain.sh --vmimage     # gcc make flex bison bc libelf-dev libssl-dev mmdebstrap e2fsprogs …
-sudo make -C firmware vmimage                   # VERSION 由 Makefile 按固件规则生成
-sudo VERSION=<YYMMDDHHMM-xxxx> firmware/vmimage/build.sh
+sudo make deps                                  # gcc make flex bison bc libelf-dev libssl-dev mmdebstrap e2fsprogs …
+sudo make image VERSION=<版本>                  # VERSION 缺省由 Makefile 按本仓库提交生成（make print-version）
+sudo VERSION=<YYMMDDHHMM-xxxx> ./build.sh       # 同上，不经 make
 ```
 
 | 环境变量 | 作用 |
 |---|---|
 | `VERSION` | 必填（`make` 目标自动给），`YYMMDDHHMM-xxxx`，脏树带 `-d` |
-| `OUT` | 产物目录，缺省 `firmware/bin/vmimage/<VERSION>/` |
+| `OUT` | 产物目录，缺省 `bin/<VERSION>/` |
 | `JOBS` | 内核编译并发，缺省 `nproc` |
 | `UBUNTU_SNAPSHOT` | 换一个快照时间点（形如 `20260929T000000Z`） |
 | `UBUNTU_MIRROR` | 改用某个 HTTPS 镜像站的当前内容（不走快照，只为本地加快；`SOURCES.txt` 与 `image.json` 如实记录） |
 | `ROOTFS_FREE_MIB` | rootfs 在内容之外留的空间，缺省 2048 |
 | `VMIMAGE_OFFLINE=1` | 不联网复核预置主机公钥 |
 
-产物（`firmware/bin/vmimage/<VERSION>/`，gitignored；先写 `<VERSION>.tmp`，全部成功才换上）：
+产物（`bin/<VERSION>/`，gitignored；先写 `<VERSION>.tmp`，全部成功才换上）：
 
 | 文件 | 内容 |
 |---|---|
 | `vmlinux`、`vmlinux.gz` | 内核及其 gzip（`-9 -n`） |
 | `rootfs.ext4`、`rootfs.ext4.gz` | rootfs 及其 gzip |
-| `image.json` | 版本、平台 `linux-amd64`、架构 `x86_64`、格式 gzip、两部分的 `gz_size` / `gz_sha256` / `size` / `sha256`（与 `vmd.ImagePart` 同名）、许可证与源码来源 |
+| `image.json` | 版本、平台 `linux-amd64`、架构 `x86_64`、格式 gzip、两部分的 `gz_size` / `gz_sha256` / `size` / `sha256`（与设备侧 `vmd.ImagePart` 同名）、许可证与源码来源 |
 | `SHA256SUMS` | 目录里其余文件的 SHA-256 |
 | `kernel.config` | 实际编译用的完整内核配置 |
 | `rootfs.packages.txt` | rootfs 里每个包的名称、版本、源码包与源码版本 |
 | `SOURCES.txt` | 许可证与源码来源说明 |
-| `release/` | 发布时原样上传的全部 asset：两部分按 Release 文件名（`vmlinux-<版本>-x86_64.gz`、`rootfs-<版本>-x86_64.ext4.gz`，与 `internal/vmimage` 的 `KernelURL` / `RootfsURL` 一致）的硬链接、上面四个说明文件、内核源码包与它们的 `SHA256SUMS` |
+| `release/` | 发布时原样上传的全部 asset：两部分按 Release 文件名（`vmlinux-<版本>-x86_64.gz`、`rootfs-<版本>-x86_64.ext4.gz`，与设备侧 `firmware/internal/vmimage` 的 `KernelURL` / `RootfsURL` 一致）的硬链接、上面四个说明文件、内核源码包与它们的 `SHA256SUMS` |
 
-下载缓存（内核源码包、`.deb`）与构建树在 `firmware/bin/vmimage/.cache`、`.work`：重复执行时内核增量编译，rootfs 每次从
+下载缓存（内核源码包、`.deb`）与构建树在 `bin/.cache`、`bin/.work`：重复执行时内核增量编译，rootfs 每次从
 头建（`.deb` 走缓存，缓存只留最近一次用到的包）。同一台机器同时只能跑一个构建。参考量级（16 核、下载约 1 MB/s）：
 冷构建约 17 分钟（内核源码下载与编译各约 2.5 分钟、rootfs 约 8 分钟、gzip 约 3.5 分钟），缓存齐全时约 6 分钟；rootfs 内容
 约 1.3 GiB、`rootfs.ext4` 3.5 GiB、压缩后约 490 MiB，`vmlinux` 约 29 MiB、压缩后约 10 MiB（确切值以产物里的
@@ -192,7 +197,7 @@ sudo VERSION=<YYMMDDHHMM-xxxx> firmware/vmimage/build.sh
 ## 开机测试
 
 ```sh
-sudo firmware/vmimage/boot-test.sh firmware/bin/vmimage/<VERSION>     # SERIAL=1 打开串口日志，KEEP=1 保留临时目录
+sudo make boot-test VERSION=<版本>     # 即 ./boot-test.sh bin/<版本>；SERIAL=1 打开串口日志，KEEP=1 保留临时目录
 ```
 
 脚本下载 Firecracker v1.17.0 官方整包（核对 SHA-256，缓存在 `/var/tmp/llmgate-vmimage-test`），建临时 tap（缺省
@@ -212,31 +217,3 @@ sudo firmware/vmimage/boot-test.sh firmware/bin/vmimage/<VERSION>     # SERIAL=1
 
 只结束自己起的进程（按 PID），结束时删掉 tap 与临时目录，不改本机 sysctl、路由与防火墙。I/O 性能与长时间稳定性要在
 真实 KVM 节点上测，不在这个脚本里。
-
-## 升级内核与 Ubuntu 快照
-
-- 内核补丁版本：改 `build.sh` 的 `KERNEL_VERSION` 与 `KERNEL_SHA256`（取 kernel.org `sha256sums.asc` 并核对签名），重新
-  构建；片段核对会拦下依赖变化。
-- Firecracker 官方配置：从新标签的 `resources/guest_configs/` 原样取回，改 `FC_TAG`、`FC_COMMIT`、
-  `FC_BASE_CONFIG_SHA256`。
-- 安全更新：把 `UBUNTU_SNAPSHOT_PIN` 改到新的时间点再构建一版。
-
-## 许可证
-
-- 内核是 GPL-2.0-only：随镜像发布内核版本、`kernel.config` 与源码来源（`SOURCES.txt`），未打补丁。
-- rootfs 里的软件包各按其许可证分发，原文在镜像内 `/usr/share/doc/<包>/copyright`；对应源码可按
-  `rootfs.packages.txt` 的源码包与版本从同一快照取得。
-- 本目录的配方与覆盖文件随固件源码以 MIT 公开。
-
-## 发布（手工执行、须用户明确要求）
-
-VM 镜像与固件同一版本格式、独立发布：制品放独立的公开发布仓库（`internal/vmimage.ReleaseRepo`）的 Release，不放
-`llm-net/llm-gate`（那里的 Release 一旦成为 latest 会打断 `install.sh` 的兜底下载）；官网只放签名清单。
-
-1. 在干净工作树上取版本：`make -C firmware print-version`（不带 `-d`）。
-2. `sudo make -C firmware vmimage VERSION=<版本>`，再 `sudo firmware/vmimage/boot-test.sh firmware/bin/vmimage/<版本>`
-   全部通过；在真实 KVM 节点上起一台验证（用测试节点须先征得同意）。
-3. 在发布仓库建 tag 为 `<版本>` 的 Release，把产物 `release/` 目录里的文件原样上传（两部分、说明文件、内核源码包
-   `linux-<KERNEL_VERSION>.tar.xz`——GPL 的对应源码——与 `SHA256SUMS`）。
-4. 清单条目取 `image.json`（两部分的精确 URL 即 `https://github.com/<ReleaseRepo>/releases/download/<版本>/<asset>`），
-   按官网组件清单的签名流程更新并部署。

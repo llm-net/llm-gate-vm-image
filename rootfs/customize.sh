@@ -3,7 +3,7 @@
 # 已由 mmdebstrap 挂好，包都已装完、服务启动被 policy-rc.d 拦住）。之后 mmdebstrap 再清掉 apt 列表与缓存、
 # /tmp、/run，并把 /etc/machine-id 写成空文件（每台 VM 首次启动时各自生成）。
 #
-# 环境变量（build.sh 导出）：VMIMAGE_VERSION（镜像版本）、VMIMAGE_DIR（配方目录 firmware/vmimage）。
+# 环境变量（build.sh 导出）：VMIMAGE_VERSION（镜像版本）、VMIMAGE_DIR（配方仓库根目录）。
 set -euo pipefail
 
 root=${1:?用法：customize.sh <chroot 目录>}

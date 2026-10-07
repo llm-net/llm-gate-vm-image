@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# 构建 Firecracker VM 镜像：guest 内核（vmlinux）与 rootfs（ext4），配方见同目录 README.md。
+# 构建 Firecracker VM 镜像：guest 内核（vmlinux）与 rootfs（ext4），配方说明见 docs/design.md。
 #
-#   sudo VERSION=<YYMMDDHHMM-xxxx> firmware/vmimage/build.sh
-#   make -C firmware vmimage                 # 同上，VERSION 由 Makefile 按固件规则生成
+#   sudo make image                          # VERSION 由 Makefile 按本仓库的提交生成（make print-version）
+#   sudo VERSION=<YYMMDDHHMM-xxxx> ./build.sh
 #
-# 产物落 $OUT（缺省 firmware/bin/vmimage/<VERSION>/，gitignored），先写到 <OUT>.tmp、全部成功才换上：
+# 产物落 $OUT（缺省 bin/<VERSION>/，gitignored），先写到 <OUT>.tmp、全部成功才换上：
 #   vmlinux  vmlinux.gz  rootfs.ext4  rootfs.ext4.gz   镜像两部分（gzip -n）及解压后的原件
 #   image.json            两部分压缩前后的长度与 SHA-256、版本与平台（签名清单的输入）
 #   SHA256SUMS            目录里其余文件的 SHA-256
@@ -12,7 +12,7 @@
 #   rootfs.packages.txt   rootfs 里的软件包：包名、版本、源码包与源码版本
 #   SOURCES.txt           许可证与源码来源
 #   release/              发布时原样上传的 asset（两部分按 Release 文件名命名的硬链接、上面几个说明文件、内核源码包）
-# 下载缓存与构建树在 firmware/bin/vmimage/.cache、.work：可重复执行，内核增量编译，rootfs 每次从头建。
+# 下载缓存与构建树在 bin/.cache、bin/.work：可重复执行，内核增量编译，rootfs 每次从头建。
 #
 # 环境变量：
 #   VERSION           必填，YYMMDDHHMM-xxxx（脏树构建带 -d）
@@ -23,11 +23,13 @@
 #   ROOTFS_FREE_MIB   rootfs 在装好的内容之外留的空间，缺省 2048
 #   VMIMAGE_OFFLINE=1 不联网复核 github.com / gitlab.com 的主机公钥（只核对本地钉住的指纹）
 set -euo pipefail
+# 经 `make image VERSION=…` 调用时，命令行变量会经 MAKEFLAGS 传给内核的 make，覆盖内核 Makefile 自己的 VERSION
+# （uname -r 就成了 <镜像版本>.18.54）。这里断开与外层 make 的联系。
+unset MAKEFLAGS MAKEOVERRIDES MFLAGS MAKELEVEL
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-FIRMWARE=$(cd "$HERE/.." && pwd)
 
-# ---- 钉住的输入（升级时连同摘要一起改，见 README「升级内核与 Ubuntu 快照」） ----
+# ---- 钉住的输入（升级时连同摘要一起改，见 docs/maintenance.md「升级」） ----
 KERNEL_VERSION=6.18.54
 # kernel.org 的 sha256sums.asc（Kernel.org checksum autosigner 签名，指纹 B8868C80BA62A1FFFAF5FDA9632D3A06589DA6B1）。
 KERNEL_SHA256=9df30b02dd8102bbd0be52556288ef6889ddbe7f1ddb96fbf847d0becf3eacac
@@ -63,10 +65,10 @@ step() { printf '\n==> [%4ds] %s\n' "$((SECONDS - t0))" "$*"; }
 VERSION=${VERSION:-}
 [[ $VERSION =~ ^[0-9]{10}-[0-9a-f]{4}(-d)?$ ]] || die "VERSION 必须是 YYMMDDHHMM-xxxx 形状（当前：${VERSION:-空}）"
 for c in curl sha256sum tar xz gzip make gcc flex bison bc perl mmdebstrap mke2fs e2fsck python3 ssh-keygen flock; do
-	command -v "$c" >/dev/null 2>&1 || die "缺少 $c：先运行 bash scripts/install-toolchain.sh --vmimage"
+	command -v "$c" >/dev/null 2>&1 || die "缺少 $c：先运行 sudo make deps"
 done
-[ -f /usr/include/libelf.h ] || die "缺少 libelf 头文件：先运行 bash scripts/install-toolchain.sh --vmimage"
-[ -f /usr/include/openssl/ssl.h ] || die "缺少 libssl 头文件：先运行 bash scripts/install-toolchain.sh --vmimage"
+[ -f /usr/include/libelf.h ] || die "缺少 libelf 头文件：先运行 sudo make deps"
+[ -f /usr/include/openssl/ssl.h ] || die "缺少 libssl 头文件：先运行 sudo make deps"
 [ -f "$UBUNTU_KEYRING" ] || die "缺少 $UBUNTU_KEYRING（ubuntu-keyring）"
 
 # 镜像内的时间戳与内核构建时间都取版本号里的时刻（与固件一样按构建机本地时区解读），同一 VERSION 的产物尽量一致。
@@ -76,7 +78,7 @@ if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
 fi
 export SOURCE_DATE_EPOCH
 
-BASE=$FIRMWARE/bin/vmimage
+BASE=$HERE/bin
 OUT=$(realpath -m "${OUT:-$BASE/$VERSION}")
 CACHE=$BASE/.cache
 WORK=$BASE/.work
@@ -286,7 +288,7 @@ EOF
 	local used_mib size_mib uuid
 	used_mib=$(du -s -x -B1M "$rootdir" | cut -f1)
 	# 装好的内容 + 10% 的元数据余量 + ROOTFS_FREE_MIB，向上取整到 256 MiB。节点的 vmd 拷贝系统盘时一律把文件撑到
-	# 16 GiB（稀疏，vmd.SystemDiskMinBytes），guest 每次启动在线 resize2fs 长满。
+	# 16 GiB（稀疏，设备侧 firmware/internal/vmd 的 SystemDiskMinBytes），guest 每次启动在线 resize2fs 长满。
 	size_mib=$(((used_mib + used_mib / 10 + ROOTFS_FREE_MIB + 255) / 256 * 256))
 	# 文件系统 UUID 与目录哈希种子由版本号推出，同一 VERSION 的镜像不因随机数不同。
 	uuid=$(printf 'llmgate-vm-rootfs %s' "$VERSION" | sha256sum | cut -c1-32 |
@@ -328,7 +330,7 @@ LLM Gate VM 镜像 $VERSION（linux-amd64 / x86_64）的许可证与源码来源
         SHA-256 $KERNEL_SHA256
   配置：本目录 kernel.config（实际编译用的完整 .config）；由 Firecracker $FC_TAG 的 $FC_BASE_CONFIG
         （$FC_BASE_CONFIG_URL，提交 $FC_COMMIT，SHA-256 $FC_BASE_CONFIG_SHA256）
-        叠加 LLM Gate 片段 firmware/vmimage/kernel/$KERNEL_FRAGMENT 后经 make olddefconfig 得到。
+        叠加 LLM Gate 片段 kernel/$KERNEL_FRAGMENT 后经 make olddefconfig 得到。
   重建：tar xf linux-$KERNEL_VERSION.tar.xz && cp kernel.config linux-$KERNEL_VERSION/.config
         && make -C linux-$KERNEL_VERSION olddefconfig vmlinux
 
@@ -337,7 +339,8 @@ rootfs rootfs.ext4
   每个包按其自身许可证分发，许可证原文在镜像内 /usr/share/doc/<包名>/copyright。
   包清单（包名、版本、源码包、源码版本）见 rootfs.packages.txt；对应源码可从同一归档（快照）按源码包与版本取得，
   例如 apt-get source <源码包>=<源码版本>。
-  LLM Gate 自己的定制（systemd 单元、脚本与配置）来自 firmware/vmimage/rootfs/，随固件源码以 MIT 公开。
+  LLM Gate 自己的定制（systemd 单元、脚本与配置）来自配方仓库的 rootfs/，以 MIT 公开：
+  https://github.com/llm-net/llm-gate-vm-image/tree/$VERSION
 EOF
 
 	python3 - "$STAGE" "$VERSION" "$KERNEL_VERSION" "$KERNEL_URL" "$KERNEL_SHA256" "$FC_TAG" "$FC_BASE_CONFIG_URL" \
@@ -357,7 +360,7 @@ def part(raw, gz, asset):
     gz_size, gz_sha = digest(os.path.join(stage, gz))
     return {"file": gz, "asset": asset, "gz_size": gz_size, "gz_sha256": gz_sha, "size": size, "sha256": sha}
 
-# asset 是 Release 上的文件名，与 internal/vmimage 的 KernelURL / RootfsURL 一致。
+# asset 是 Release 上的文件名，与设备侧 llm-net/llm-gate 的 firmware/internal/vmimage KernelURL / RootfsURL 一致。
 kernel = part("vmlinux", "vmlinux.gz", "vmlinux-" + version + "-x86_64.gz")
 kernel.update({"linux_version": kver, "license": "GPL-2.0-only"})
 rootfs = part("rootfs.ext4", "rootfs.ext4.gz", "rootfs-" + version + "-x86_64.ext4.gz")
@@ -374,7 +377,7 @@ doc = {
     "source": {
         "kernel": {"url": kurl, "sha256": ksha, "config": "kernel.config",
                    "config_base": {"firecracker": fctag, "url": fcurl, "sha256": fcsha},
-                   "config_fragment": "firmware/vmimage/kernel/llmgate.config"},
+                   "config_fragment": "kernel/llmgate.config"},
         "rootfs": {"archive": mirror, "snapshot": snapshot, "packages": "rootfs.packages.txt"},
     },
 }
@@ -386,7 +389,7 @@ EOF
 	(cd "$STAGE" && sha256sum vmlinux vmlinux.gz rootfs.ext4 rootfs.ext4.gz image.json kernel.config \
 		rootfs.packages.txt SOURCES.txt >SHA256SUMS)
 
-	# release/：发布时原样上传的全部 asset（硬链接，不另占空间）。两部分按 internal/vmimage 的 KernelURL / RootfsURL
+	# release/：发布时原样上传的全部 asset（硬链接，不另占空间）。两部分按设备侧 firmware/internal/vmimage 的 KernelURL / RootfsURL
 	# 命名，另带内核源码包（GPL 的对应源码）。
 	local rel=$STAGE/release f
 	mkdir -p "$rel"

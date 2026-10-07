@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # VM 镜像开机冒烟测试：用 Firecracker 官方整包在本机起一台 microVM，按 vmd 的方式建系统盘与数据盘（mke2fs -d 种子）、
-# 传内核命令行，逐项核对 guest 契约（firmware/internal/vmd/api.go「guest 与节点之间的约定」）与三种退出路径。
+# 传内核命令行，逐项核对 guest 契约（docs/design.md「guest 契约」；设备侧以 llm-net/llm-gate 的 firmware/internal/vmd/api.go 为准）与三种退出路径。
 #
-#   sudo firmware/vmimage/boot-test.sh firmware/bin/vmimage/<VERSION>
+#   sudo make boot-test VERSION=<版本>
+#   sudo ./boot-test.sh bin/<VERSION>
 #
 # 需要：root、/dev/kvm、iproute2、e2fsprogs、openssh-client、python3、curl。冒烟测试不经 jailer。
 #
@@ -16,7 +17,7 @@
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-IMAGE_DIR=$(realpath "${1:?用法：boot-test.sh <镜像产物目录，如 firmware/bin/vmimage/VERSION>}")
+IMAGE_DIR=$(realpath "${1:?用法：boot-test.sh <镜像产物目录，如 bin/VERSION>}")
 
 FC_VERSION=1.17.0
 FC_ARCH=x86_64
@@ -110,7 +111,7 @@ make_system_disk() {
 	fi
 }
 
-# ---- 数据盘：vmd 的做法（第 5.2 节）——稀疏文件 + mke2fs -d 种子，不挂载 ----
+# ---- 数据盘：vmd 的做法（docs/design.md「数据盘种子」）——稀疏文件 + mke2fs -d 种子，不挂载 ----
 make_data_disk() {
 	local seed=$RUN/seed
 	rm -rf "$seed"
